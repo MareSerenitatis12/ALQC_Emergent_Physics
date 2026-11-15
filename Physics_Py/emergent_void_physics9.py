@@ -736,9 +736,6 @@ class EmergentField:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
                 if event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_r:
                         self.is_recording = True
