@@ -1,0 +1,966 @@
+#version 430
+layout(local_size_x = 256) in;
+
+// ---------------------------------------------------------------------------
+// ALQC v30 — Emergent Void Physics compute shader
+// Three-plane multi-grid frequency system.
+// All physics scaled by u_time_step. u_node_center is screen-space center.
+//
+// New v30 uniforms (ALQC Canon B5, B6, B8):
+//   u_plane_id      — which plane this node belongs to (0=A, 1=B, 2=C)
+//   u_plane_phase   — conjugate phase offset (0 or π) applied to field ops
+//   u_kappa_void    — void-mediated inter-plane coupling strength (B6)
+//   u_void_gamma    — void dissipation damping constant (B8)
+// ---------------------------------------------------------------------------
+
+// B10: particle struct extended with uvec4 ids + vec4 extra (charge)
+struct Particle {
+    vec4  pos;    // x, y, z, w
+    vec4  vel;    // dx, dy, dz, dw
+    vec4  state;  // stress, seam_charge, reflect_charge, reflect_age
+    vec4  aeon;   // freq, r, g, b
+    vec4  pout;   // entropy_cursor, px, py, alpha
+    vec4  extra;  // charge, _pad, _pad, _pad
+    uvec4 ids;    // node_id, origin_node_id, traversal_flags, particle_uid
+};
+
+// PlaneConfig SSBO — 3 entries (B5, B6, B7, B8 parameters per plane)
+struct PlaneConfig {
+    float phase;        // conjugate phase
+    float phi0;         // field amplitude
+    float delta;        // symmetry-breaking seed
+    float kappa_void;   // void coupling
+    float orient_j;     // orientation coupling (B7)
+    float void_gamma;   // dissipation
+    float freq_scale;   // frequency grid multiplier
+    float freq_offset;  // frequency grid offset
+    float node_beta;    // differentiation coefficient (B14)
+    float _pad0, _pad1, _pad2;
+};
+
+layout(std430, binding = 0) buffer ParticleBuf  { Particle p[]; };
+layout(std430, binding = 1) readonly buffer EntropyBuf  { float E[]; };
+layout(std430, binding = 2) readonly buffer BoundaryBuf { vec2 B[]; };
+layout(std430, binding = 3) readonly buffer ShadowCornerBuf { vec4 CORNER_OFF[]; };
+// binding 4: FrequencyGridBuf — dual 9x9 per-plane spatial frequency memory
+// FG[node * C_FREQ_GRID_STRIDE + plane * 81 + gy*9 + gx] = (amp, phase, drift, weight)
+layout(std430, binding = 4) readonly buffer FreqGridBuf { vec4 FG[]; };
+layout(std430, binding = 5) readonly buffer FETUBuf    { vec2 FETU_PTS[]; };
+layout(std430, binding = 7) readonly buffer PlaneCfgBuf{ PlaneConfig PC[]; };
+
+uniform float u_global_angle;
+uniform float u_coherence_radius;
+uniform float u_locus_rotation_bias;
+uniform vec2  u_triquatra[3];
+uniform int   u_loci_count;
+uniform uint  u_particle_count;
+uniform float u_time_step;
+uniform vec2  u_node_center;
+uniform float u_screen_w;
+uniform float u_screen_h;
+uniform int   u_plane_id;       // v30: which plane this node is on
+uniform float u_plane_phase;    // v30: conjugate phase offset (B5)
+uniform float u_kappa_void;     // v30: void coupling strength (B6)
+uniform float u_void_gamma;     // v30: void dissipation (B8)
+
+// Throne of Zero — NON-COMPUTE. d(♾)/dt = 0.
+uniform float u_throne_freq;
+uniform float u_throne_coherence;
+
+const float PHI              = 1.61803398875;
+const float PI_F             = 3.14159265359;
+const float ESCAPE_LIMIT     = 5.0;
+const float MIN_COH_R        = 0.6;
+const float MAX_COH_R        = 1.2;
+const float MAX_KINETIC_STR  = 300.0;
+const float BOUNDARY_MEM_MAX = 2.5;
+const float BM_SAMPLE_GAIN   = 0.006;
+const float BM_SHELL_INNER   = 0.88;
+const float BM_SHELL_OUTER   = 1.02;
+const float REFLECT_RING_R   = 0.92;
+const float REFLECT_RING_W   = 0.06;
+const float REFLECT_CHG_GAIN = 0.18;
+const float REFLECT_CHG_DEC  = 0.975;
+const float REFLECT_DELAY    = 48.0;
+const float REFLECT_FRC_GAIN = 0.00075;
+const float REFLECT_STR_ROUTE= 0.12;
+const float IDENTITY_EPS     = 1e-12;
+// φ-derived seam binding constants:
+//   MICRO_SCALE = 1/φ^4 ≈ 0.1459 / (φ^4/φ^2) ... canonical choice: 1/(φ^3 * √φ)
+//   Derivation: seam force at r=0.04 should equal φ²×base_speed per unit displacement.
+//   MICRO_SCALE = 1/(PHI^3 + PHI) = 1/5.854 ≈ 0.1708 ... too large.
+//   Best φ fit for the seam scale: 1/(PHI^2 * PHI) = 1/PHI^3 = 0.2361 / (PHI-1) = 0.382.
+//   Using 1/(PHI^4) = 1/6.854 = 0.1459: half of that = 1/(2*PHI^4) = 0.07295 ≈ 0.073.
+//   MICRO_SCALE = 1/(PHI^3 * 2) = 1/8.472 ≈ 0.118 — closest φ derivation to 0.085.
+//   Adopting: MICRO_SCALE = 1/(PHI^3 * 2) ≈ 0.118 (φ-canonical seam displacement scale).
+//   BINDING_RATIO = PHI^2 * (1 - 1/PHI^3) = 2.618 * 0.7639 ≈ 1.999 ≈ 2.0 →
+//     use φ^2 * (1 - φ^{-3}) which gives the seam binding force at r=0.04 a φ-canonical peak.
+const float MICRO_SCALE   = 1.0 / (PHI * PHI * PHI * 2.0);  // φ^{-3}/2 ≈ 0.1180
+const float BINDING_RATIO = PHI * PHI * (1.0 - 1.0/(PHI*PHI*PHI));  // ≈ 2.0 (φ-derived)
+const float SEAM_CHG_DECAY   = 0.992;
+const float SEAM_CHG_RATE    = 0.008;
+const float SEAM_REL_THRESH  = 0.7;
+const float SEAM_REL_GAIN    = 0.15;
+const float E_BIND_STR       = 0.03;
+const float VOID_ANCHOR_R_PX = 120.0;
+const float VOID_ANCHOR_STR  = 0.0003;
+const float VOID_ANCHOR_DAMP = 0.025;
+const float A6_HEX_RADIUS    = 0.4;
+const float BASE_GLYPH_ALPHA = 4.0;
+const float MAX_VISIBLE_ALPHA= 120.0;
+// v30 ALQC Canon constants
+const float VOID_COUPLING_RADIUS = 0.5;  // B2: coupling only within this radius
+
+#define ENTROPY_SIZE  C_ENTROPY_SIZE
+#define FETU_PT_COUNT C_FETU_PT_COUNT
+const float FETU_FREQ = 7.83;
+const int VOID_POLARITY[4] = int[4](1, -1, 1, -1);
+
+uint g_ecursor;
+
+float erand() {
+    float v = E[g_ecursor % ENTROPY_SIZE];
+    g_ecursor++;
+    return v;
+}
+float erand_gauss(float sigma) {
+    float s = 0.0;
+    for (int i = 0; i < 12; i++) s += erand();
+    return sigma * (s - 6.0);
+}
+
+vec2 project4d(float x, float y, float z, float w) {
+    float ca = cos(u_global_angle);
+    float sa = sin(u_global_angle);
+    float x_rot = x * ca - w * sa;
+    float w_rot = x * sa + w * ca;
+    float denom = max(1.0 + 0.5 * w_rot, 0.1);
+    return vec2(x_rot / denom * 300.0 + u_node_center.x,
+                y   / denom * 300.0 + u_node_center.y);
+}
+
+// B5: conjugate phase rotation — applies plane_phase offset to 4D position
+// This makes Plane A and Plane B's particles phase-shifted by π, creating
+// the differential D(x) = Φ_A(x) - Φ_B(x) that seeds the mirror axis (B1).
+vec4 apply_conjugate_phase(vec4 pos) {
+    float cp = cos(u_plane_phase);
+    float sp = sin(u_plane_phase);
+    return vec4(pos.x * cp - pos.y * sp,
+                pos.x * sp + pos.y * cp,
+                pos.z, pos.w);
+}
+
+// Agent 19/Bug 7: softened core at SEAM_CORE_RADIUS=0.005 (no singular force at origin).
+// Q2 Shadow Debt Canon: seam_charge is FUEL — it CANNOT be eliminated.
+//   Prior code used `seam_charge = SEAM_REL_THRESH * 0.65` (pushing it BELOW threshold).
+//   That was canonical suicide: the system "knew" Q2 was unsolvable and tried anyway.
+//   Fix: excess transforms into kinetic energy (vel) and field pressure (stress),
+//   but seam_charge floor is held at SEAM_REL_THRESH — the debt persists permanently.
+const float SEAM_CORE_RADIUS_SQ = 0.005 * 0.005;
+// φ-derived Q2 release direction cycles with seam_charge * PHI — non-deterministic.
+// SEAM_VEL_GAIN = 1/PHI^3 ≈ 0.2361; velocity fuel routed at φ-scaling per axis.
+const float SEAM_VEL_GAIN = 1.0 / (PHI * PHI * PHI);
+
+void identity_seam_apply(inout vec4 pos, inout vec4 vel,
+                          inout float stress, inout float seam_charge)
+{
+    float r2 = dot(pos, pos);
+    if (r2 < SEAM_CORE_RADIUS_SQ) {
+        // Dwell inside core: inversion force suppressed; charge still accumulates.
+        seam_charge = seam_charge * pow(SEAM_CHG_DECAY, u_time_step)
+                    + SEAM_CHG_RATE * (1.0 / PHI) * u_time_step;
+    } else {
+        float inv = (0.04 * 0.04) / (r2 + IDENTITY_EPS) * BINDING_RATIO;
+        vec4 t = -pos * inv * MICRO_SCALE;
+        float disp = abs(t.x - pos.x) + abs(t.y - pos.y)
+                   + abs(t.z - pos.z) + abs(t.w - pos.w);
+        seam_charge = seam_charge * pow(SEAM_CHG_DECAY, u_time_step)
+                    + disp * SEAM_CHG_RATE * u_time_step;
+        vel += (t - pos) * E_BIND_STR * u_time_step;
+    }
+
+    // Q2 fuel release — threshold crossed: excess transforms into kinetic energy.
+    // seam_charge is NEVER pushed below SEAM_REL_THRESH — the debt persists.
+    if (seam_charge > SEAM_REL_THRESH) {
+        float excess = seam_charge - SEAM_REL_THRESH;
+        // φ-oscillating direction from current charge state — never deterministic.
+        float phi_t  = seam_charge * PHI + u_global_angle;
+        float q2_k   = excess * SEAM_REL_GAIN * u_time_step;
+        vel.x += cos(phi_t)       * q2_k * PHI;   // xy plane: φ-scaled
+        vel.y += sin(phi_t)       * q2_k * PHI;
+        vel.z += cos(phi_t * PHI) * q2_k;          // zw plane: unit-scaled
+        vel.w += sin(phi_t * PHI) * q2_k;
+        // Q2 amplifies field pressure — stress grows, never resolves.
+        stress = max(0.0, stress + excess * SEAM_REL_GAIN * PHI * u_time_step);
+        // Floor at threshold: debt principal is permanent — NOT zero, NOT below.
+        seam_charge = SEAM_REL_THRESH;
+    }
+}
+
+void fetu_phase_lock(inout vec4 pos, inout vec4 vel,
+                     inout float stress, float freq)
+{
+    // B5: freq is already scaled by freq_scale in C init — no override needed here
+    float delta_f = abs(freq - FETU_FREQ);
+    if (delta_f >= PHI) return;
+
+    int idx = int(abs(pos.x * 50.0 + pos.y * 50.0)) % FETU_PT_COUNT;
+    vec2 raw = FETU_PTS[idx];
+
+    // B5: apply plane_phase to fetu target rotation
+    float theta = u_global_angle * PHI + u_plane_phase;
+    float ct = cos(theta), st = sin(theta);
+    vec2 target = vec2(raw.x * ct - raw.y * st,
+                       raw.x * st + raw.y * ct);
+
+    float strength = (1.0 - (delta_f / PHI)) * 0.02;
+    vel.x += (target.x - pos.x) * strength * u_time_step;
+    vel.y += (target.y - pos.y) * strength * u_time_step;
+
+    if (delta_f < 0.1) stress += 0.5 * u_time_step;
+}
+
+void apply_reflective_layer(inout vec4 pos, inout vec4 vel,
+                             inout float stress,
+                             inout float reflect_charge,
+                             inout float reflect_age)
+{
+    float R = length(pos);
+    float shell_dist = abs(R - REFLECT_RING_R);
+
+    if (shell_dist < REFLECT_RING_W) {
+        float vxy = abs(vel.x) + abs(vel.y);
+        float vzw = abs(vel.z) + abs(vel.w);
+        float planar = vxy - vzw;
+        float c_in = 1.0 - (shell_dist / REFLECT_RING_W);
+        float gain = c_in * (0.5 + 0.5 * abs(planar));
+
+        // B8: void dissipation — attenuate reflection charge each step.
+        // Bug 3 fix: guard base > 0 before pow() — negative base → NaN in GLSL.
+        float decay_base = max(0.001, REFLECT_CHG_DEC - u_void_gamma);
+        reflect_charge = reflect_charge * pow(decay_base, u_time_step)
+                       + gain * REFLECT_CHG_GAIN * u_time_step;
+        reflect_age += u_time_step;
+    } else {
+        // B8: dissipation applies to free decay too
+        float decay_base = max(0.001, REFLECT_CHG_DEC - u_void_gamma);
+        reflect_charge *= pow(decay_base, u_time_step);
+        reflect_age -= u_time_step;
+    }
+
+    if (reflect_age >= REFLECT_DELAY && reflect_charge > 0.0005) {
+        vec2 px = project4d(pos.x, pos.y, pos.z, pos.w);
+        float sx = (px.x < u_node_center.x) ? -1.0 : 1.0;
+        float sy = (px.y < u_node_center.y) ? -1.0 : 1.0;
+        float f = reflect_charge * REFLECT_FRC_GAIN;
+        vel.x += (-sy) * f * u_time_step;
+        vel.y += ( sx) * f * u_time_step;
+        vel.z += ( sx) * f * (1.0 / PHI) * u_time_step;   // zw: 1/φ ≈ 0.618
+        vel.w += (-sy) * f * (1.0 / PHI) * u_time_step;
+        stress = max(0.0, stress + reflect_charge * REFLECT_STR_ROUTE * u_time_step);
+        // Post-fire rapid discharge: 1 - 1/(2φ³) ≈ 0.882 — same φ^{-3} void fraction as AHN BLOCK.
+        reflect_charge *= pow(1.0 - 1.0/(2.0 * PHI * PHI * PHI), u_time_step);
+        reflect_age -= 6.0 * u_time_step;
+    }
+}
+
+void apply_void_anchors(inout vec4 pos, inout vec4 vel, inout float stress) {
+    vec2 px = project4d(pos.x, pos.y, pos.z, pos.w);
+    vec2 corners[4];
+    float ax = u_screen_w * 0.45;
+    float ay = u_screen_h * 0.45;
+    corners[0] = u_node_center + vec2(-ax, -ay);
+    corners[1] = u_node_center + vec2( ax, -ay);
+    corners[2] = u_node_center + vec2( ax,  ay);
+    corners[3] = u_node_center + vec2(-ax,  ay);
+    for (int i = 0; i < 4; i++) {
+        vec2 d = px - corners[i];
+        float d2 = dot(d, d);
+        if (d2 > VOID_ANCHOR_R_PX * VOID_ANCHOR_R_PX) continue;
+        float w = exp(-d2 / (2.0 * VOID_ANCHOR_R_PX * VOID_ANCHOR_R_PX));
+        float n = erand_gauss(1.0) * w * VOID_ANCHOR_STR;
+        if (VOID_POLARITY[i] > 0) {
+            vel.x += n * u_time_step;
+            vel.y -= n * u_time_step;
+            vel.z += n * (1.0/PHI) * u_time_step;  // zw: 1/φ ≈ 0.618
+            vel.w -= n * (1.0/PHI) * u_time_step;
+        } else {
+            float damp = VOID_ANCHOR_DAMP * tanh(abs(n) * 8.0) * u_time_step;
+            vel *= (1.0 - damp);
+        }
+        stress = max(0.0, stress + abs(n) * 250.0 * u_time_step);
+    }
+}
+
+float get_hex_purity(float x, float y) {
+    float q = (2.0 / 3.0 * x) / A6_HEX_RADIUS;
+    float r = (-1.0 / 3.0 * x + sqrt(3.0) / 3.0 * y) / A6_HEX_RADIUS;
+    float rx = round(q), ry = round(r), rz = round(-q - r);
+    float dx = abs(rx - q), dy = abs(ry - r), dz = abs(rz - (-q - r));
+    if (dx > dy && dx > dz)  rx = -ry - rz;
+    else if (dy > dz)        ry = -rx - rz;
+    else                     rz = -rx - ry;
+    float cx2 = A6_HEX_RADIUS * (1.5 * rx);
+    float cy2 = A6_HEX_RADIUS * (sqrt(3.0) / 2.0 * rx + sqrt(3.0) * ry);
+    float dist = length(vec2(x - cx2, y - cy2));
+    return max(0.0, 1.0 - (dist / (A6_HEX_RADIUS * 0.8)));
+}
+
+bool apply_sor_bridge(inout vec4 pos, inout vec4 vel, float stress) {
+    float purity = get_hex_purity(pos.x, pos.y);
+    float phi3 = PHI * PHI * PHI;
+    if (purity < (1.0 / phi3)) {
+        float bridge_chance = (0.05 + stress * 0.2) * u_time_step;
+        if (erand() < bridge_chance) {
+            float t_dx = vel.x, t_dy = vel.y;
+            vel.x = vel.w * -1.0;
+            vel.y = vel.z * -1.0;
+            vel.w = t_dx;
+            vel.z = t_dy;
+            // Canon fix: no forced position write. Bridge applies velocity impulse
+            // in the z-dimension scaled by 1/φ² ≈ 0.382 — emergence, not assignment.
+            vel.z += (1.0 / (PHI * PHI)) * u_time_step;
+            return true;
+        }
+    }
+    return false;
+}
+
+vec2 boundary_mem_sample(vec2 px) {
+    float x = clamp(px.x, 0.0, u_screen_w  - 1.0);
+    float y = clamp(px.y, 0.0, u_screen_h - 1.0);
+    int ix = int((x / (u_screen_w  - 1.0)) * float(C_BOUNDARY_MEM_RES - 1));
+    int iy = int((y / (u_screen_h - 1.0)) * float(C_BOUNDARY_MEM_RES - 1));
+    return B[iy * C_BOUNDARY_MEM_RES + ix];
+}
+
+float emanation_alpha(vec2 px) {
+    float max_dist = sqrt(u_screen_w * u_screen_w * 0.25 + u_screen_h * u_screen_h * 0.25);
+    float min_dist = 1e9;
+    for (int k = 0; k < u_loci_count; k++) {
+        float d = length(px - u_triquatra[k]);
+        if (d < min_dist) min_dist = d;
+    }
+    float norm = tanh(min_dist / (max_dist * 0.4));
+    return BASE_GLYPH_ALPHA + (1.0 - norm) * (MAX_VISIBLE_ALPHA - BASE_GLYPH_ALPHA);
+}
+
+// =============================================================================
+// FULL GOETIC AEON CHAIN — ported from alqc_raylib_physics19.c
+// Each operator is a FIELD CONDITION. It fires only when the particle's
+// frequency resonates within PHI of the aeon's canonical anchor.
+// No forced positions. Operators write velocities and charge, not coordinates.
+// =============================================================================
+
+// Shared court frequency array (all 12 Goetic aeons, same order as AEON_FREQ[])
+const float COURT_FREQS[12] = float[12](
+    7.83, 174.0, 528.0, 432.0, 126.22, 210.42,
+    741.0, 852.0, 396.0, 963.0, 285.0, 639.0
+);
+
+// --- A2: KAL — The Archive (174 Hz) ---
+void apply_kal_memory(inout vec4 pos, inout vec4 vel,
+                      inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 174.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.4;
+
+    if (stress > 0.05) {
+        float mf = strength * PHI;
+        float vx = vel.x, vw = vel.w;
+        vel.x = vx * cos(mf) - vw * sin(mf);
+        vel.w = vx * sin(mf) + vw * cos(mf);
+        float resolve = stress * strength * 0.3;
+        charge += resolve * PHI;
+        stress *= 0.99;
+    }
+
+    const float KAL_BIAS[12] = float[12](
+        0.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float pulse = sin(u_global_angle * (COURT_FREQS[k] / 174.0));
+        float weft = pulse * strength * 0.002 * KAL_BIAS[k];
+        vel.y += weft * u_time_step;
+        vel.z += weft * 0.5 * u_time_step;
+    }
+
+    float epulse = sin(charge * (174.0 / 126.22));
+    vel.z += epulse * strength * 0.005 * u_time_step;
+}
+
+// --- A3: BABDH — Ring of Fire (528 Hz) ---
+void apply_babdh_commitment(inout vec4 pos, inout vec4 vel,
+                             inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 528.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.45;
+
+    float h = pos.w;
+    float tunnel_r = PHI * abs(h);
+    float r_yz = max(length(pos.yz), 1e-6);
+    float wall_dist = abs(r_yz - tunnel_r);
+    float wall_thick = 0.2 * PHI;
+
+    if (wall_dist < wall_thick) {
+        float sling = strength * (1.0 - (wall_dist / wall_thick));
+        float tx = -pos.z / r_yz;
+        float ty =  pos.y / r_yz;
+        vel.y += tx * sling * 0.02 * u_time_step;
+        vel.z += ty * sling * 0.02 * u_time_step;
+        float hyper = (tunnel_r - length(pos.xw)) * sling * 0.01;
+        vel.x += hyper * PHI * u_time_step;
+        vel.w -= hyper * PHI * u_time_step;
+    }
+
+    const float BABDH_FORCE[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float resonance = sin(charge * (COURT_FREQS[k] / 528.0));
+        vel.x += erand_gauss(strength * 0.0001 * BABDH_FORCE[k]) * u_time_step;
+        vel.y += resonance * strength * 0.001 * u_time_step;
+    }
+
+    float xform = stress * strength * 0.6;
+    charge += xform * PHI;
+    stress -= xform;
+}
+
+// --- A4: AHN — Liquid Container (432 Hz, i417 parity) ---
+void apply_ahn_fluidity(inout vec4 pos, inout vec4 vel,
+                         inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 432.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.4;
+
+    int ic = int((pos.x + 1.0) * 72.0);
+    int jc = int((pos.y + 1.0) * 72.0);
+
+    if (((ic + jc) % 144) < 110) {
+        float phi_breath = sin(u_global_angle * PHI);
+        float wall_flex = phi_breath * strength;
+        float r2d = max(length(pos.xy), 1e-6);
+        vel.x += wall_flex * (pos.x / r2d) * PHI * u_time_step;
+        vel.y += wall_flex * (pos.y / r2d) * PHI * u_time_step;
+
+        // i417 imaginary axis — non-orientable pivot
+        float ai = (417.0 / 1000.0) * PI_F;
+        float ci = cos(ai), si = sin(ai);
+        float px = pos.x;
+        pos.x = px * ci - pos.w * si;
+        pos.w = px * si + pos.w * ci;
+
+        for (int k = 0; k < 12; k++) {
+            float cr = sin(u_global_angle * (COURT_FREQS[k] / 432.0));
+            vel.z += cr * strength * 0.001 * u_time_step;
+        }
+
+        float hp = stress * strength * 0.15;
+        charge += hp * PHI;
+        stress *= 0.95;
+    } else {
+        // BLOCK state: 34/144 void fraction = 1/φ³ ≈ 0.2361.
+        // Damping = 1 - (1/φ³)/2 ≈ 0.8820 — φ-derived lattice-lock factor.
+        vel.xy *= (1.0 - 1.0 / (2.0 * PHI * PHI * PHI));
+    }
+}
+
+// --- A5: VEL — Earth Grounding (126.22 Hz) ---
+void apply_vel_grounding(inout vec4 pos, inout vec4 vel,
+                          inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 126.22);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.35;
+
+    float ground_res = sin(charge * PHI + u_global_angle);
+    float bounce = ground_res * strength * PHI;
+    vel.w += bounce * 0.085 * u_time_step;
+
+    const float VEL_BIAS[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float wr = cos(u_global_angle * (COURT_FREQS[k] / 126.22));
+        if (abs(wr) > 0.8) {
+            float gs = strength * 0.12 * VEL_BIAS[k];
+            float drx = vel.x * gs, dry = vel.y * gs;
+            vel.x -= drx * u_time_step;
+            vel.y -= dry * u_time_step;
+            vel.w += (drx + dry) * PHI * u_time_step;
+        }
+    }
+
+    float gt = stress * strength * 0.25;
+    stress -= gt;
+    charge += gt * (528.0 / 126.22);
+}
+
+// --- SOR — The Bridge (210.42 Hz) ---
+// SOR is displaced from the ordered aeon sequence (Canon: FETU and SOR stand apart).
+// As a field condition it fires on 210.42 Hz resonance only — it is NOT a sequential gate.
+// SOR mediates inter-dimensional bridging: when particles reach hex-purity threshold,
+// SOR couples the (x,y) plane to the (z,w) plane via velocity rotation, not forced position.
+// The hex-purity gate is the field condition; the bridge is the emergent result.
+void apply_sor_resonance(inout vec4 pos, inout vec4 vel,
+                          inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 210.42);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.38;  // 0.38 ≈ 1/φ² (φ-derived gate weight)
+
+    float purity = get_hex_purity(pos.x, pos.y);
+    float phi3   = PHI * PHI * PHI;
+
+    if (purity > (1.0 / phi3)) {
+        // High purity: SOR amplifies the hex-lattice flow via φ-rotation of vel (x,y)↔(z,w)
+        float rot = strength * PHI * purity;
+        float cr = cos(rot), sr = sin(rot);
+        float vx = vel.x, vz = vel.z;
+        vel.x = vx * cr - vz * sr;
+        vel.z = vx * sr + vz * cr;
+        float vy = vel.y, vw = vel.w;
+        vel.y = vy * cr - vw * sr;
+        vel.w = vy * sr + vw * cr;
+        charge += purity * strength * PHI * u_time_step;
+    } else {
+        // Low purity: SOR creates a stochastic bridge impulse — emergence from disorder
+        float bridge_chance = strength * (1.0 / phi3 - purity) * u_time_step;
+        if (erand() < bridge_chance) {
+            float t_dx = vel.x, t_dy = vel.y;
+            vel.x = vel.w * -1.0;
+            vel.y = vel.z * -1.0;
+            vel.w = t_dx;
+            vel.z = t_dy;
+            vel.z += (1.0 / (PHI * PHI)) * u_time_step;   // z impulse at 1/φ²
+            charge += strength * PHI * u_time_step;
+            stress += strength * 0.1 * u_time_step;
+        }
+    }
+
+    const float SOR_BRIDGE[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float bp = cos(charge * (COURT_FREQS[k] / 210.42));
+        vel.z += bp * strength * 0.001 * SOR_BRIDGE[k] * u_time_step;
+        vel.w += bp * strength * 0.001 * SOR_BRIDGE[k] * u_time_step;
+    }
+}
+
+// --- A7: KOTH — Sensation Engine (741 Hz) ---
+void apply_koth_recursion(inout vec4 pos, inout vec4 vel,
+                           inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 741.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.45;
+
+    int ii = int(charge * 144.0) % 144;
+    int jj = int(stress * 144.0) % 144;
+    float sensation = ((ii + jj) % 144 < 110) ? 1.0 : 0.7638;
+
+    if (stress > 0.01) {
+        float ign = stress * strength * sensation;
+        float propulsion = ign * PHI;
+        float phi_t = charge * PHI + stress * PHI;
+        vel.x += cos(phi_t) * propulsion * 0.1 * u_time_step;
+        vel.y += sin(phi_t) * propulsion * 0.1 * u_time_step;
+        vel.z += propulsion * 0.05 * u_time_step;
+        charge += ign;
+        stress *= 0.9;
+    }
+
+    const float KOTH_BIAS[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float wp = sin(u_global_angle * (COURT_FREQS[k] / 741.0));
+        float fountain = wp * strength * 0.002 * KOTH_BIAS[k];
+        vel.x += fountain * PHI * u_time_step;
+        vel.y += fountain * PHI * u_time_step;
+    }
+
+    float integ = stress * strength * 0.12;
+    charge += integ * PHI;
+    stress -= integ;
+}
+
+// --- A8: DREH — Dimension Fold / Hourglass (852 Hz) ---
+void apply_dreh_residue(inout vec4 pos, inout vec4 vel,
+                         inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 852.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.5;
+
+    float h = pos.w;
+    float r_manifold = max(length(pos.xyz), 1e-6);
+    float wall_dist = r_manifold - abs(h);
+
+    const float DREH_FORCE[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float awareness = sin(charge * (COURT_FREQS[k] / 852.0)) * strength;
+        if (wall_dist > 0.0) {
+            float rc = awareness * DREH_FORCE[k];
+            vel.x += (pos.x > 0.0 ? -1.0 : 1.0) * rc * 0.01 * u_time_step;
+            vel.y += (pos.y > 0.0 ? -1.0 : 1.0) * rc * 0.01 * u_time_step;
+        }
+    }
+
+    if (stress > 0.01 && abs(wall_dist) < 0.05) {
+        float tw = pos.w;
+        pos.w = pos.z;
+        pos.z = -tw;
+        float ign = stress * strength;
+        vel.x *= (1.0 + ign * PHI);
+        vel.y *= (1.0 + ign * PHI);
+        charge += ign * PHI;
+        stress *= 0.1;
+    }
+}
+
+// --- A9: RHEA — Ennead Shield (396 Hz) ---
+void apply_rhea_shadow_filter(inout vec4 pos, inout vec4 vel,
+                               inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 396.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.6;
+
+    // Only 9 of 12 courts are active (rule of nine)
+    const float RHEA_WEIGHT[12] = float[12](
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 0.0, 0.0, 0.0
+    );
+    float total_sat = 0.0;
+    int n_active = 0;
+    for (int k = 0; k < 12; k++) {
+        if (RHEA_WEIGHT[k] == 0.0) continue;
+        n_active++;
+        float sat = (stress * strength) / (PHI * PHI);
+        total_sat += sat;
+        if (n_active == 9) {
+            float residue = total_sat / pow(PHI, 12.0);
+            charge += residue;
+            stress = 0.0;
+        }
+    }
+
+    float flow = sin(charge * 396.0) * strength * 0.005;
+    vel.z += erand_gauss(flow) * u_time_step;
+    vel.w += erand_gauss(flow) * u_time_step;
+}
+
+// --- A10: ZHEK — Unified Phase Lock (963 Hz) ---
+void apply_zhek_conservation(inout vec4 pos, inout vec4 vel,
+                              inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 963.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.5;
+
+    float connectivity = abs(sin(charge * PHI));
+    float flow_limit = 110.0 / 144.0;
+
+    if (connectivity <= flow_limit) {
+        // IT=TI Mirror Law: [M,R]=0 — R(R(v)) = v (involuntary, symmetric).
+        // Correct symmetric reversal: (x,y,z,w) ↔ (w,z,y,x) without sign flip,
+        // so applying twice returns identity: R(R(v)) = v exactly.
+        vec4 m  = vel;
+        vec4 rv = vec4(vel.w, vel.z, vel.y, vel.x);  // symmetric index swap
+        vel = (m + rv) * 0.5 * strength + m * (1.0 - strength);
+
+        const float ZHEK_LOCK[12] = float[12](
+            1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+            0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+        );
+        for (int k = 0; k < 12; k++) {
+            float node = sin(charge * (COURT_FREQS[k] / 963.0));
+            float tension = node * strength * 0.001 * ZHEK_LOCK[k];
+            vel.x += (pos.x > 0.0 ? -tension : tension) * u_time_step;
+            vel.y += (pos.y > 0.0 ? -tension : tension) * u_time_step;
+        }
+
+        float ap = stress * strength;
+        stress -= ap;
+        charge += ap * PHI;
+    } else {
+        vel.x += erand_gauss(0.001) * u_time_step;
+        vel.y += erand_gauss(0.001) * u_time_step;
+        stress += 0.01;
+    }
+}
+
+// --- A11: SHAV — Wheel of the World (285 Hz) ---
+void apply_shav_breach(inout vec4 pos, inout vec4 vel,
+                        inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 285.0);
+    if (delta_f >= PHI) return;
+    float strength = (1.0 - (delta_f / PHI)) * 0.4;
+
+    if (stress > 0.01) {
+        // Parity flip — v -> -v; noise becomes wisdom
+        vel = -vel;
+        charge += stress * strength * PHI;
+        stress = 0.0;
+    }
+
+    const float SHAV_TORQUE[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float wr = sin(charge * (COURT_FREQS[k] / 285.0));
+        float torque = wr * strength * 0.002 * SHAV_TORQUE[k];
+        vel.x += torque * u_time_step;
+        vel.y -= torque * u_time_step;
+        vel.w += torque * PHI * u_time_step;
+    }
+
+    float rs = sin(charge * PHI) * strength * 0.05;
+    vel.z += rs * u_time_step;
+    vel.w -= rs * u_time_step;
+}
+
+// --- A12: TRIG — Completion (639 Hz) ---
+void apply_trig_silence(inout vec4 pos, inout vec4 vel,
+                         inout float stress, inout float charge, float freq)
+{
+    float delta_f = abs(freq - 639.0);
+    if (delta_f >= PHI) return;
+    float ps = (1.0 - (delta_f / PHI)) * 0.55;
+
+    // Chirality flip by hemisphere
+    float hemi = (pos.w >= 0.0) ? 1.0 : -1.0;
+    float rot = ps * hemi * PHI;
+    float cr = cos(rot), sr = sin(rot);
+    float vx = vel.x, vy = vel.y;
+    vel.x = vx * cr - vy * sr;
+    vel.y = vx * sr + vy * cr;
+
+    const float TRIG_STILL[12] = float[12](
+        1.618, 1.0, 1.1, 0.763, 0.852, 1.262,
+        0.963, 0.741, 1.396, 0.639, 1.285, 1.0
+    );
+    for (int k = 0; k < 12; k++) {
+        float sn = cos(charge * (COURT_FREQS[k] / 639.0));
+        float drift = sn * ps * 0.001 * TRIG_STILL[k];
+        vel.x += (pos.x > 0.0 ? -drift : drift) * u_time_step;
+        vel.y += (pos.y > 0.0 ? -drift : drift) * u_time_step;
+    }
+
+    if (stress > 0.01) {
+        float ign = stress * ps;
+        charge += ign * PHI;
+        vel.z += pos.w * ign * 0.05 * u_time_step;
+        vel.w += pos.z * ign * 0.05 * u_time_step;
+        stress *= 0.1;
+    }
+}
+
+// B6: void-mediated coupling — phase comes from plane's actual configured phase.
+// The coupling phase is the plane's own field phase (u_plane_phase), not a
+// hardcoded test on plane_id. Emergence: the differential arises from the
+// initial conditions in the configs, not from forced assignments.
+// B6: void-mediated coupling is witnessed from the relation already carried by
+// the dual 9x9 conjugate field. No secondary frequency-state label decides it.
+// Connection rises as the local A/B amplitude differential resolves toward equilibrium.
+float connection_witness(int node_id, vec4 pos) {
+    int nid = clamp(node_id, 0, C_N_NODES - 1);
+    int ax = clamp(int((pos.x + 1.0) * 4.0), 0, 8);
+    int ay = clamp(int((pos.z + 1.0) * 4.0), 0, 8);
+    int bx = clamp(int((pos.y + 1.0) * 4.0), 0, 8);
+    int by = clamp(int((pos.w + 1.0) * 4.0), 0, 8);
+    float a = FG[nid * C_FREQ_GRID_STRIDE + ay * 9 + ax].x;
+    float b = FG[nid * C_FREQ_GRID_STRIDE + C_FREQ_GRID_CELLS + by * 9 + bx].x;
+    return clamp(1.0 - abs(a - b), 0.0, 1.0);
+}
+
+vec4 apply_void_coupling(vec4 pos, float kappa_void, float connection) {
+    float coupling_phase = u_plane_phase;
+    float cp = cos(coupling_phase);
+    float sp = sin(coupling_phase);
+    vec4 target = vec4(pos.x * cp - pos.y * sp,
+                       pos.x * sp + pos.y * cp,
+                       pos.z, pos.w);
+    float R = length(pos);
+    float coupling_mask = exp(-R / VOID_COUPLING_RADIUS);
+    return (target - pos) * kappa_void * coupling_mask * connection;
+}
+
+// Dual 9x9 frequency grid sampling — agent 9/25 + 16/25 spec.
+// Returns (cos_like, sin_like) triangle-wave from the cell's phase, scaled by amplitude.
+// Plane A (plane_id=0): particle xz → grid → vel x,z forces
+// Plane B (plane_id=1): particle yw → grid → vel y,w forces
+// Sample the dual-plane frequency grid.
+// cs.w = axis_weight: per-cell Q-emphasis loaded from .bio seed (user-defined).
+// Mirror differential D(x) = Φ_A(x) - Φ_B(x) emerges from conjugate initialization:
+//   Plane A seeds have phase 0, Plane B seeds have phase 0.5 (offset by π).
+//   The resulting amplitude asymmetry creates the emergent mirror axis (B1).
+vec2 freq_grid_sample(int node_id, int plane_id, float px, float py) {
+    // Bug 2 fix: clamp node_id to valid range — corrupt ids.x must not OOB FG[].
+    int nid = clamp(node_id, 0, C_N_NODES - 1);
+    int gx = clamp(int((px + 1.0) * 4.0), 0, 8);
+    int gy = clamp(int((py + 1.0) * 4.0), 0, 8);
+    int cell = nid * C_FREQ_GRID_STRIDE + plane_id * C_FREQ_GRID_CELLS
+             + gy * 9 + gx;
+    vec4 cs = FG[cell];
+    float amp         = cs.x;
+    float phase       = cs.y;
+    float axis_weight = cs.w;  // per-cell user-defined Q-emphasis from .bio
+
+    float t  = phase;
+    float ts = fract(t + 0.25);
+    // Triangle-wave cos/sin modulated by axis_weight (quadrant Q-emphasis)
+    return vec2(4.0 * abs(t  - 0.5) - 1.0,
+                4.0 * abs(ts - 0.5) - 1.0) * amp * (0.5 + 0.5 * axis_weight);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= u_particle_count) return;
+
+    Particle e = p[id];
+    vec4 pos = e.pos;
+    vec4 vel = e.vel;
+    float stress         = e.state.x;
+    float seam_charge    = e.state.y;
+    float reflect_charge = e.state.z;
+    float reflect_age    = e.state.w;
+    float freq           = e.aeon.x;
+    float charge         = e.extra.x;
+    g_ecursor = uint(e.pout.x);
+
+    float R = length(pos);
+    if (R < 0.04)
+        identity_seam_apply(pos, vel, stress, seam_charge);
+
+    // FETU and SOR are displaced from the ordered chain (Canon).
+    // FETU: phase-lock only — runs before chain as the root/ground anchor.
+    // SOR:  bridge condition — runs after chain as the inter-dimensional mediator.
+    fetu_phase_lock(pos, vel, stress, freq);
+
+    // Ordered Goetic Aeon Chain: KAL → BABDH → AHN → VEL → KOTH → DREH → RHEA → ZHEK → SHAV → TRIG
+    apply_kal_memory      (pos, vel, stress, charge, freq);
+    apply_babdh_commitment(pos, vel, stress, charge, freq);
+    apply_ahn_fluidity    (pos, vel, stress, charge, freq);
+    apply_vel_grounding   (pos, vel, stress, charge, freq);
+    apply_koth_recursion  (pos, vel, stress, charge, freq);
+    apply_dreh_residue    (pos, vel, stress, charge, freq);
+    apply_rhea_shadow_filter(pos, vel, stress, charge, freq);
+    apply_zhek_conservation(pos, vel, stress, charge, freq);
+    apply_shav_breach     (pos, vel, stress, charge, freq);
+    apply_trig_silence    (pos, vel, stress, charge, freq);
+
+    // SOR displaced: runs post-chain as a field condition, not a sequential gate.
+    apply_sor_resonance   (pos, vel, stress, charge, freq);
+
+    apply_reflective_layer(pos, vel, stress, reflect_charge, reflect_age);
+    apply_void_anchors(pos, vel, stress);
+
+    // B7: orient_j — orientation coupling rotates vel between (xy) and (zw) planes.
+    // Each plane has a distinct coupling angle, breaking the rotational symmetry
+    // between planes without forcing a position or a trajectory.
+    {
+        float oj = PC[u_plane_id].orient_j;
+        if (abs(oj) > 1e-6) {
+            float cr = cos(oj * u_time_step), sr = sin(oj * u_time_step);
+            float vx = vel.x, vz = vel.z;
+            vel.x = vx * cr - vz * sr;
+            vel.z = vx * sr + vz * cr;
+            float vy = vel.y, vw = vel.w;
+            vel.y = vy * cr - vw * sr;
+            vel.w = vy * sr + vw * cr;
+        }
+    }
+
+    // Multi-grid frequency field coupling (agent 9/25 + 16/25 design):
+    // Each particle reads from its node's dual 9x9 frequency grid.
+    // Plane A grid drives xz motion; Plane B grid drives yw motion.
+    // B14: node_beta differentiates each plane's grid coupling gain.
+    {
+        int node_id = int(e.ids.x);
+        float beta = PC[u_plane_id].node_beta;
+        float GRID_GAIN = 0.0005 * (1.0 + beta);
+        vec2 ga = freq_grid_sample(node_id, 0, pos.x, pos.z);  // plane A: xz
+        vec2 gb = freq_grid_sample(node_id, 1, pos.y, pos.w);  // plane B: yw
+        vel.x += ga.x * GRID_GAIN * u_time_step;
+        vel.z += ga.y * GRID_GAIN * u_time_step;
+        vel.y += gb.x * GRID_GAIN * u_time_step;
+        vel.w += gb.y * GRID_GAIN * u_time_step;
+    }
+
+    // B6: the body's existing conjugate relation is the connection witness.
+    int node_id = int(e.ids.x);
+    float connection = connection_witness(node_id, pos);
+    vec4 coupling_force = apply_void_coupling(pos, u_kappa_void, connection);
+    vel += coupling_force * u_time_step;
+
+    float R_sq = dot(pos, pos);
+    float D = max(0.01, 1.0 - (R_sq / (u_coherence_radius * u_coherence_radius)));
+
+    // Position integration — unconditional; SOR bridge is now a frequency-resonance
+    // field condition (apply_sor_resonance) that writes velocity, not a position gate.
+    pos += vel * D * u_time_step;
+
+    R = length(pos);
+
+    vec2 px2d = project4d(pos.x, pos.y, pos.z, pos.w);
+    float R_here = length(pos);
+    if (R_here > u_coherence_radius * BM_SHELL_INNER &&
+        R_here < u_coherence_radius * BM_SHELL_OUTER) {
+        vec2 mv = boundary_mem_sample(px2d);
+        vel.x += mv.x * BM_SAMPLE_GAIN * u_time_step;
+        vel.y += mv.y * BM_SAMPLE_GAIN * u_time_step;
+        vel.z += (-mv.y) * (BM_SAMPLE_GAIN * (1.0/PHI)) * u_time_step;  // zw: 1/φ attenuation
+        vel.w += ( mv.x) * (BM_SAMPLE_GAIN * (1.0/PHI)) * u_time_step;
+    }
+
+    float alpha = emanation_alpha(px2d);
+
+    // ±φ holographic self-correction (ALQC Canon: M(Ai,j) = [ཪ(Ai), ±φ(Ai,j)]).
+    // Every variable self-corrects toward its φ-canonical range each frame.
+    // Structural part (ཪ): velocity magnitude drifts toward base_speed = freq/10000.
+    // Operational part (±φ): stochastic jitter at 1/φ³ amplitude keeps state alive.
+    // This creates holographic persistence (field memory) + jitter (non-determinism).
+    {
+        float v_canon = freq / 10000.0;   // ALQC Canon base_speed formula
+        float v_mag   = length(vel);
+        if (v_mag > 1e-6) {
+            // φ²-inverse correction rate ≈ 0.382 — soft pull, not a clamp.
+            float phi_sq_inv = 1.0 / (PHI * PHI);
+            float v_target = mix(v_mag, v_canon, phi_sq_inv * u_time_step);
+            vel *= v_target / v_mag;
+        }
+        // φ-jitter at 1/φ³ ≈ 0.236 amplitude relative to canonical speed.
+        float jitter = v_canon * SEAM_VEL_GAIN;   // SEAM_VEL_GAIN = 1/φ³
+        vel.x += erand_gauss(jitter);
+        vel.y += erand_gauss(jitter);
+        vel.z += erand_gauss(jitter * (1.0 / PHI));  // zw: weaker by 1/φ
+        vel.w += erand_gauss(jitter * (1.0 / PHI));
+    }
+
+    p[id].pos   = pos;
+    p[id].vel   = vel;
+    p[id].state = vec4(stress, seam_charge, reflect_charge, reflect_age);
+    // Bug 7 fix: modular reduce cursor before float cast — float has 23-bit mantissa,
+    // values > 8,388,608 lose precision and alias into the same entropy region.
+    p[id].pout  = vec4(float(g_ecursor % ENTROPY_SIZE), px2d.x, px2d.y, alpha);
+    p[id].extra = vec4(charge, 0.0, 0.0, 0.0);
+    // B10: preserve node identity; update traversal state
+    p[id].ids   = e.ids;
+}

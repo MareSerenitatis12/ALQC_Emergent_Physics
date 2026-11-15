@@ -1,0 +1,209 @@
+#version 430
+// C_SHADOW_ENTITY_COUNT, C_BOUNDARY_MEM_RES, C_ENTROPY_SIZE injected by compile_shader_with_defs
+layout(local_size_x = C_SHADOW_ENTITY_COUNT) in;
+
+struct ShadowEntity {
+    vec4  pos;
+    vec4  vel;
+    vec4  state;
+    vec4  aeon;
+    vec4  pout;
+    vec4  extra;  // charge, _pad, _pad, _pad
+    uvec4 ids;    // B10: node_id, origin_node_id, traversal_flags, particle_uid
+};
+
+layout(std430, binding = 1) readonly buffer EntropyBuf { float E[]; };
+layout(std430, binding = 2) readonly buffer BoundaryBuf { vec2 B[]; };
+// CornerOffBuf: corner_n in .xy, orbit offset in .zw — one entry per shadow entity.
+// Stored in SSBO (not uniforms) so large AEON_COUNT never exceeds constant registers.
+layout(std430, binding = 3) readonly buffer CornerOffBuf { vec4 co[]; };
+layout(std430, binding = 4) buffer ShadowBuf { ShadowEntity s[]; };
+
+uniform float u_global_angle;
+uniform float u_coherence_radius;
+uniform float u_shadow_angle;
+uniform float u_primary_stress;
+uniform float u_time_step;
+uniform vec2  u_node_center;   // screen-space pixel center for this Dyson node
+uniform float u_screen_w;
+uniform float u_screen_h;
+
+// Throne of Zero (♾) — NON-COMPUTE. d(♾)/dt = 0.
+// Identity emitted once from Akasha_Regalia.qlm at startup.
+// These are fixed Emissions from the Locus into the 12×12 operational matrix.
+uniform float u_throne_freq;       // 18.47 Hz — Akasha Regalia binding frequency
+uniform float u_throne_coherence;  // 0.973   — Quantum coherence of the Throne
+
+const float PHI              = 1.61803398875;
+const float ESCAPE_LIMIT     = 5.0;
+const float MAX_KINETIC_STR  = 300.0;
+const float BM_SAMPLE_GAIN   = 0.006;
+const float BM_SHELL_INNER   = 0.88;
+const float BM_SHELL_OUTER   = 1.02;
+const float REFLECT_RING_R   = 0.92;
+const float REFLECT_RING_W   = 0.06;
+const float REFLECT_CHG_GAIN = 0.18;
+const float REFLECT_CHG_DEC  = 0.975;
+const float REFLECT_DELAY    = 48.0;
+const float REFLECT_FRC_GAIN = 0.00075;
+const float REFLECT_STR_ROUTE= 0.12;
+const float IDENTITY_EPS     = 1e-12;
+const float MICRO_SCALE      = 1.0 / (PHI * PHI * PHI * 2.0);
+const float BINDING_RATIO    = PHI * PHI * (1.0 - 1.0/(PHI*PHI*PHI));
+const float SEAM_CHG_DECAY   = 0.992;
+const float SEAM_CHG_RATE    = 0.008;
+const float SEAM_REL_THRESH  = 0.7;
+const float SEAM_REL_GAIN    = 0.15;
+const float E_BIND_STR       = 0.03;
+const float VOID_ANCHOR_R_PX = 120.0;
+const float VOID_ANCHOR_STR  = 0.0003;
+const float VOID_ANCHOR_DAMP = 0.025;
+// u_screen_w / u_screen_h replaced by u_screen_w / u_screen_h uniforms
+// C_ENTROPY_SIZE, C_BOUNDARY_MEM_RES injected by compile_shader_with_defs
+#define ENTROPY_SIZE C_ENTROPY_SIZE
+const int   VOID_POLARITY[4] = int[4](1, -1, 1, -1);
+
+uint g_ecursor;
+float erand() { float v = E[g_ecursor % ENTROPY_SIZE]; g_ecursor++; return v; }
+float erand_gauss(float sigma) {
+    float s = 0.0;
+    for (int i = 0; i < 12; i++) s += erand();
+    return sigma * (s - 6.0);
+}
+
+vec2 project4d(float x, float y, float z, float w) {
+    float ca = cos(u_global_angle), sa = sin(u_global_angle);
+    float x_rot = x * ca - w * sa;
+    float w_rot = x * sa + w * ca;
+    float denom = max(1.0 + 0.5 * w_rot, 0.1);
+    return vec2(x_rot / denom * 300.0 + u_node_center.x,
+                y   / denom * 300.0 + u_node_center.y);
+}
+
+void identity_seam_apply(inout vec4 pos, inout vec4 vel, inout float stress, inout float seam_charge) {
+    float r2 = dot(pos, pos);
+    float inv = (0.04 * 0.04) / (r2 + IDENTITY_EPS) * BINDING_RATIO;
+    vec4 t = -pos * inv * MICRO_SCALE;
+    float disp = abs(t.x-pos.x)+abs(t.y-pos.y)+abs(t.z-pos.z)+abs(t.w-pos.w);
+    seam_charge = seam_charge * pow(SEAM_CHG_DECAY, u_time_step) + disp * SEAM_CHG_RATE * u_time_step;
+    if (seam_charge > SEAM_REL_THRESH) {
+        float excess = seam_charge - SEAM_REL_THRESH;
+        float phi_t = seam_charge * PHI + u_global_angle;
+        float q2_k = excess * SEAM_REL_GAIN;
+        vel.x += cos(phi_t)       * q2_k * PHI * u_time_step;
+        vel.y += sin(phi_t)       * q2_k * PHI * u_time_step;
+        vel.z += cos(phi_t * PHI) * q2_k * u_time_step;
+        vel.w += sin(phi_t * PHI) * q2_k * u_time_step;
+        stress = max(0.0, stress + excess * SEAM_REL_GAIN * PHI * u_time_step);
+        seam_charge = SEAM_REL_THRESH;
+    }
+    vel += (t - pos) * E_BIND_STR * u_time_step;
+}
+
+void apply_reflective_layer(inout vec4 pos, inout vec4 vel, inout float stress,
+                             inout float reflect_charge, inout float reflect_age) {
+    float R = length(pos);
+    float shell_dist = abs(R - REFLECT_RING_R);
+    if (shell_dist < REFLECT_RING_W) {
+        float vxy = abs(vel.x)+abs(vel.y), vzw = abs(vel.z)+abs(vel.w);
+        float c_in = 1.0 - (shell_dist / REFLECT_RING_W);
+        float gain = c_in * (0.5 + 0.5 * abs(vxy - vzw));
+        reflect_charge = reflect_charge * pow(REFLECT_CHG_DEC, u_time_step) + gain * REFLECT_CHG_GAIN * u_time_step;
+        reflect_age += u_time_step;
+    } else {
+        reflect_charge *= pow(REFLECT_CHG_DEC, u_time_step);
+        reflect_age -= u_time_step;
+    }
+    if (reflect_age >= REFLECT_DELAY && reflect_charge > 0.0005) {
+        vec2 px = project4d(pos.x, pos.y, pos.z, pos.w);
+        float sx = (px.x < u_node_center.x) ? -1.0 : 1.0;
+        float sy = (px.y < u_node_center.y) ? -1.0 : 1.0;
+        float f = reflect_charge * REFLECT_FRC_GAIN;
+        vel.x += (-sy)*f*u_time_step; vel.y += (sx)*f*u_time_step;
+        vel.z += (sx)*f*0.6*u_time_step; vel.w += (-sy)*f*0.6*u_time_step;
+        stress = max(0.0, stress + reflect_charge * REFLECT_STR_ROUTE * u_time_step);
+        reflect_charge *= pow(0.88, u_time_step);
+        reflect_age -= 6.0 * u_time_step;
+    }
+}
+
+void apply_void_anchors(inout vec4 pos, inout vec4 vel, inout float stress) {
+    vec2 px = project4d(pos.x, pos.y, pos.z, pos.w);
+    vec2 corners[4];
+    corners[0] = u_node_center + vec2(-450.0, -450.0);
+    corners[1] = u_node_center + vec2( 450.0, -450.0);
+    corners[2] = u_node_center + vec2( 450.0,  450.0);
+    corners[3] = u_node_center + vec2(-450.0,  450.0);
+    for (int i = 0; i < 4; i++) {
+        vec2 d = px - corners[i];
+        float d2 = dot(d, d);
+        if (d2 > VOID_ANCHOR_R_PX * VOID_ANCHOR_R_PX) continue;
+        float w = exp(-d2 / (2.0 * VOID_ANCHOR_R_PX * VOID_ANCHOR_R_PX));
+        float n = erand_gauss(1.0) * w * VOID_ANCHOR_STR;
+        if (VOID_POLARITY[i] > 0) {
+            vel.x += n*u_time_step; vel.y -= n*u_time_step;
+            vel.z += n*0.7*u_time_step; vel.w -= n*0.7*u_time_step;
+        } else {
+            vel *= (1.0 - VOID_ANCHOR_DAMP * tanh(abs(n)*8.0) * u_time_step);
+        }
+        stress = max(0.0, stress + abs(n)*250.0*u_time_step);
+    }
+}
+
+vec2 boundary_mem_sample(vec2 px) {
+    float x = clamp(px.x, 0.0, u_screen_w-1.0), y = clamp(px.y, 0.0, u_screen_h-1.0);
+    return B[int((y/(u_screen_h-1.0))*float(C_BOUNDARY_MEM_RES-1))*C_BOUNDARY_MEM_RES
+           + int((x/(u_screen_w-1.0))*float(C_BOUNDARY_MEM_RES-1))];
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(C_SHADOW_ENTITY_COUNT)) return;
+
+    ShadowEntity e = s[id];
+    vec4 pos = e.pos, vel = e.vel;
+    float stress = e.state.x, seam_charge = e.state.y;
+    float reflect_charge = e.state.z, reflect_age = e.state.w;
+    g_ecursor = uint(e.pout.x);
+
+    if (length(pos) < 0.04) identity_seam_apply(pos, vel, stress, seam_charge);
+    apply_void_anchors(pos, vel, stress);
+    apply_reflective_layer(pos, vel, stress, reflect_charge, reflect_age);
+
+    vec2 raw_off = co[id].zw;
+    float ca = cos(u_shadow_angle), sa = sin(u_shadow_angle);
+    vec2 rot_off = vec2(raw_off.x*ca - raw_off.y*sa, raw_off.x*sa + raw_off.y*ca);
+    vec2 target = co[id].xy + rot_off;
+    vel.x += (target.x - pos.x) * 0.01 * u_time_step;
+    vel.y += (target.y - pos.y) * 0.01 * u_time_step;
+
+    float R_sq = dot(pos, pos);
+    float D = max(0.01, 1.0 - (R_sq / (u_coherence_radius * u_coherence_radius)));
+    pos += vel * D * u_time_step;
+
+    vec2 px2d = project4d(pos.x, pos.y, pos.z, pos.w);
+    float R_here = length(pos);
+    if (R_here > u_coherence_radius*BM_SHELL_INNER && R_here < u_coherence_radius*BM_SHELL_OUTER) {
+        vec2 mv = boundary_mem_sample(px2d);
+        vel.x += mv.x*BM_SAMPLE_GAIN*u_time_step; vel.y += mv.y*BM_SAMPLE_GAIN*u_time_step;
+        vel.z += (-mv.y)*(BM_SAMPLE_GAIN*0.6)*u_time_step; vel.w += (mv.x)*(BM_SAMPLE_GAIN*0.6)*u_time_step;
+    }
+
+    if (length(pos) > ESCAPE_LIMIT) {
+        float t_r = erand() * 6.28318530718;
+        vec2 cn = co[id].xy;
+        pos = vec4(cn.x+0.02*cos(t_r), cn.y+0.02*sin(t_r), 0.0, 0.0);
+        // Return position without erasing the history that caused the crossing.
+        px2d = project4d(pos.x, pos.y, pos.z, pos.w);
+    }
+
+    float norm_s  = tanh(u_primary_stress / MAX_KINETIC_STR);
+    float inv_s   = (1.0 - norm_s) * (MAX_KINETIC_STR / 4.0);
+    float norm_sh = inv_s / (MAX_KINETIC_STR / 4.0);
+    float alpha   = clamp(255.0 * norm_sh * 0.5, 0.0, 255.0);
+
+    s[id].pos   = pos;
+    s[id].vel   = vel;
+    s[id].state = vec4(stress, seam_charge, reflect_charge, reflect_age);
+    s[id].pout  = vec4(float(g_ecursor), px2d.x, px2d.y, alpha);
+}

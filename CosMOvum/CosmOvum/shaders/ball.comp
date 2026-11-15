@@ -1,0 +1,276 @@
+#version 430
+// C_ENTROPY_SIZE, C_BOUNDARY_MEM_RES injected by compile_shader_with_defs
+layout(local_size_x = 64) in;
+
+struct BallEntity {
+    vec4 pos;    // x, y, z, w
+    vec4 vel;    // dx, dy, dz, dw
+    vec4 state;  // stress, seam_charge, reflect_charge, reflect_age
+    vec4 aeon;   // aeon_idx (as float), r, g, b (0-255)
+    vec4 pout;   // entropy_cursor, px, py, alpha
+    vec4 extra;  // charge, _pad, _pad, _pad
+};
+
+layout(std430, binding = 1) readonly buffer EntropyBuf { float E[]; };
+layout(std430, binding = 2) readonly buffer BoundaryBuf { vec2 B[]; };
+layout(std430, binding = 6) buffer BallBuf  { BallEntity b[]; };
+// binding 7 reused here — ball and physics passes run sequentially (no conflict)
+layout(std430, binding = 7) buffer PhaseBuf { vec2 PM[]; };  // phase, drift — 20×20×12
+
+uniform float u_global_angle;
+uniform float u_coherence_radius;
+uniform float u_primary_stress;
+uniform float u_screen_w;
+uniform float u_screen_h;
+uniform uint  u_ball_count;
+
+const float PHI              = 1.61803398875;
+const float ESCAPE_LIMIT     = 5.0;
+const float MAX_KINETIC_STR  = 300.0;
+const float BM_SAMPLE_GAIN   = 0.006;
+const float BM_SHELL_INNER   = 0.88;
+const float BM_SHELL_OUTER   = 1.02;
+const float REFLECT_RING_R   = 0.92;
+const float REFLECT_RING_W   = 0.06;
+const float REFLECT_CHG_GAIN = 0.18;
+const float REFLECT_CHG_DEC  = 0.975;
+const float REFLECT_DELAY    = 48.0;
+const float REFLECT_FRC_GAIN = 0.00075;
+const float REFLECT_STR_ROUTE= 0.12;
+const float IDENTITY_EPS     = 1e-12;
+// φ-derived seam binding (matching physics.comp):
+const float MICRO_SCALE   = 1.0 / (PHI * PHI * PHI * 2.0);  // φ^{-3}/2 ≈ 0.1180
+const float BINDING_RATIO = PHI * PHI * (1.0 - 1.0/(PHI*PHI*PHI));  // ≈ 2.0
+const float SEAM_CHG_DECAY   = 0.992;
+const float SEAM_CHG_RATE    = 0.008;
+const float SEAM_REL_THRESH  = 0.7;
+const float SEAM_REL_GAIN    = 0.15;
+const float E_BIND_STR       = 0.03;
+const float VOID_ANCHOR_R_PX = 120.0;
+const float VOID_ANCHOR_STR  = 0.0003;
+const float VOID_ANCHOR_DAMP = 0.025;
+const int   VOID_POLARITY[4] = int[4](1, -1, 1, -1);
+// v10.py SHADOW_LOCUS_POSITIONS — void anchors for global ball entities
+const vec2 CORNERS[4] = vec2[4](
+    vec2(50.0, 50.0), vec2(950.0, 50.0),
+    vec2(950.0, 950.0), vec2(50.0, 950.0)
+);
+
+const float NODE_CHARGE_DAMP  = 0.992;
+const float ELVEN_RESP_GAIN   = 0.0005;
+const float COHERENCE_RED_STR = 0.85;
+
+uint g_ecursor;
+
+float erand() {
+    float v = E[g_ecursor % C_ENTROPY_SIZE];
+    g_ecursor++;
+    return v;
+}
+
+float erand_gauss(float sigma) {
+    float s = 0.0;
+    for (int i = 0; i < 12; i++) s += erand();
+    return sigma * (s - 6.0);
+}
+
+vec2 project4d(float x, float y, float z, float w) {
+    float ca = cos(u_global_angle);
+    float sa = sin(u_global_angle);
+    float x_rot = x * ca - w * sa;
+    float w_rot = x * sa + w * ca;
+    float denom = max(1.0 + 0.5 * w_rot, 0.1);
+    return vec2(x_rot / denom * 300.0 + u_screen_w * 0.5,
+                y   / denom * 300.0 + u_screen_h * 0.5);
+}
+
+// Q2 Shadow Debt: never zeroed — same Canon rule as physics.comp.
+const float SEAM_CORE_R2 = 0.005 * 0.005;
+
+void identity_seam_apply(inout vec4 pos, inout vec4 vel,
+                          inout float stress, inout float seam_charge) {
+    float r2 = dot(pos, pos);
+    if (r2 < SEAM_CORE_R2) {
+        seam_charge = seam_charge * SEAM_CHG_DECAY
+                    + SEAM_CHG_RATE * (1.0 / PHI);
+    } else {
+        float inv = (0.04 * 0.04) / (r2 + IDENTITY_EPS) * BINDING_RATIO;
+        vec4 t = -pos * inv * MICRO_SCALE;
+        float disp = abs(t.x - pos.x) + abs(t.y - pos.y)
+                   + abs(t.z - pos.z) + abs(t.w - pos.w);
+        seam_charge = seam_charge * SEAM_CHG_DECAY + disp * SEAM_CHG_RATE;
+        vel += (t - pos) * E_BIND_STR;
+    }
+    // Q2 fuel release — excess transforms into 4D kinetic energy; debt floor persists.
+    if (seam_charge > SEAM_REL_THRESH) {
+        float excess = seam_charge - SEAM_REL_THRESH;
+        float phi_t  = seam_charge * PHI + u_global_angle;
+        float q2_k   = excess * SEAM_REL_GAIN;
+        vel.x += cos(phi_t)       * q2_k * PHI;
+        vel.y += sin(phi_t)       * q2_k * PHI;
+        vel.z += cos(phi_t * PHI) * q2_k;
+        vel.w += sin(phi_t * PHI) * q2_k;
+        stress = max(0.0, stress + excess * SEAM_REL_GAIN * PHI);
+        seam_charge = SEAM_REL_THRESH;  // debt floor — not zeroed
+    }
+}
+
+void apply_reflective_layer(inout vec4 pos, inout vec4 vel,
+                             inout float stress,
+                             inout float reflect_charge,
+                             inout float reflect_age) {
+    float R = length(pos);
+    float shell_dist = abs(R - REFLECT_RING_R);
+    if (shell_dist < REFLECT_RING_W) {
+        float vxy = abs(vel.x) + abs(vel.y);
+        float vzw = abs(vel.z) + abs(vel.w);
+        float planar = vxy - vzw;
+        float c_in = 1.0 - (shell_dist / REFLECT_RING_W);
+        float gain = c_in * (0.5 + 0.5 * abs(planar));
+        reflect_charge = reflect_charge * REFLECT_CHG_DEC + gain * REFLECT_CHG_GAIN;
+        reflect_age += 1.0;
+    } else {
+        reflect_charge *= REFLECT_CHG_DEC;
+        reflect_age -= 1.0;
+    }
+    if (reflect_age >= REFLECT_DELAY && reflect_charge > 0.0005) {
+        vec2 px = project4d(pos.x, pos.y, pos.z, pos.w);
+        float sx = (px.x < u_screen_w * 0.5) ? -1.0 : 1.0;
+        float sy = (px.y < u_screen_h * 0.5) ? -1.0 : 1.0;
+        float f = reflect_charge * REFLECT_FRC_GAIN;
+        vel.x += (-sy) * f; vel.y += ( sx) * f;
+        vel.z += ( sx) * f * (1.0/PHI); vel.w += (-sy) * f * (1.0/PHI);  // zw: 1/φ
+        stress = max(0.0, stress + reflect_charge * REFLECT_STR_ROUTE);
+        // Post-fire discharge: 1 - 1/(2φ³) ≈ 0.882 — φ-derived void fraction
+        reflect_charge *= (1.0 - 1.0/(2.0 * PHI * PHI * PHI));
+        reflect_age -= 6.0;
+    }
+}
+
+void apply_void_anchors(inout vec4 pos, inout vec4 vel, inout float stress) {
+    vec2 px = project4d(pos.x, pos.y, pos.z, pos.w);
+    for (int i = 0; i < 4; i++) {
+        vec2 d = px - CORNERS[i];
+        float d2 = dot(d, d);
+        if (d2 > VOID_ANCHOR_R_PX * VOID_ANCHOR_R_PX) continue;
+        float w = exp(-d2 / (2.0 * VOID_ANCHOR_R_PX * VOID_ANCHOR_R_PX));
+        float n = erand_gauss(1.0) * w * VOID_ANCHOR_STR;
+        if (VOID_POLARITY[i] > 0) {
+            vel.x += n; vel.y -= n;
+            vel.z += n * (1.0/PHI); vel.w -= n * (1.0/PHI);  // zw: 1/φ ≈ 0.618
+        } else {
+            float damp = VOID_ANCHOR_DAMP * tanh(abs(n) * 8.0);
+            vel *= (1.0 - damp);
+        }
+        stress = max(0.0, stress + abs(n) * 250.0);
+    }
+}
+
+vec2 boundary_mem_sample(vec2 px) {
+    float x = clamp(px.x, 0.0, u_screen_w - 1.0);
+    float y = clamp(px.y, 0.0, u_screen_h - 1.0);
+    int ix = int((x / (u_screen_w - 1.0)) * float(C_BOUNDARY_MEM_RES - 1));
+    int iy = int((y / (u_screen_h - 1.0)) * float(C_BOUNDARY_MEM_RES - 1));
+    return B[iy * C_BOUNDARY_MEM_RES + ix];
+}
+
+// emergent_cos_sin — v10.py lines 158-171
+// Region maps normalized position [-2,2] → grid [0,19]; triangle-wave phase
+// Agent 18/Bug 5 fix: use injected defines C_PHASE_MEM_W and C_N_NODES — no hardcoded 12.
+vec2 emergent_cos_sin(int aeon_idx, float x, float y, float sv) {
+    int gx   = clamp(int((x + 2.0) * 5.0), 0, C_PHASE_MEM_W - 1);
+    int gy   = clamp(int((y + 2.0) * 5.0), 0, C_PHASE_MEM_H - 1);
+    int cell = gy * C_PHASE_MEM_W * C_N_NODES + gx * C_N_NODES
+             + clamp(aeon_idx, 0, C_N_NODES - 1);
+    vec2 cm  = PM[cell];
+    if (cm.x == 0.0 && cm.y == 0.0) {
+        cm.x = erand();
+        float d = erand_gauss(0.002);
+        cm.y = max(abs(d), 0.001);
+    }
+    float debt = sv * (1.0 + erand_gauss(0.12));
+    cm.x += cm.y * (1.0 + debt);
+    PM[cell] = cm;
+    float t  = fract(cm.x);
+    float ts = fract(t + 0.25);
+    return vec2(4.0 * abs(t  - 0.5) - 1.0,
+                4.0 * abs(ts - 0.5) - 1.0);
+}
+
+// emergent_distance — v10.py lines 173-177
+float emergent_distance(vec4 vel) {
+    float acc = abs(vel.x) + abs(vel.y) + abs(vel.z) + abs(vel.w);
+    if (acc == 0.0) return 0.0;
+    float rf = 1.0 + erand_gauss(0.08);
+    return acc * rf / 2.0;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= u_ball_count) return;
+
+    BallEntity e = b[id];
+    vec4 pos = e.pos;
+    vec4 vel = e.vel;
+    float stress         = e.state.x;
+    float seam_charge    = e.state.y;
+    float reflect_charge = e.state.z;
+    float reflect_age    = e.state.w;
+    float charge         = e.extra.x;
+    int   aeon_idx       = int(e.aeon.x);
+    g_ecursor = uint(e.pout.x);
+
+    // 1. emergent_cos_sin force (v10.py lines 607-609)
+    vec2 cs = emergent_cos_sin(aeon_idx, pos.x, pos.y, u_primary_stress);
+    vel.x += cs.x * ELVEN_RESP_GAIN;
+    vel.y += cs.y * ELVEN_RESP_GAIN;
+
+    // 2. Identity seam (v10.py lines 611-613)
+    if (length(pos) < 0.04)
+        identity_seam_apply(pos, vel, stress, seam_charge);
+
+    // 3. Void anchors (v10.py line 615)
+    apply_void_anchors(pos, vel, stress);
+
+    // 4. Reflective layer (v10.py line 616)
+    apply_reflective_layer(pos, vel, stress, reflect_charge, reflect_age);
+
+    // 5. emergent_distance coherence reduction (v10.py lines 618-620)
+    float dist = emergent_distance(vel);
+    if (dist > u_coherence_radius) charge *= COHERENCE_RED_STR;
+
+    // 6. Coherence damp + integrate (v10.py lines 622-628)
+    float R_sq = dot(pos, pos);
+    float D = max(0.01, 1.0 - (R_sq / (u_coherence_radius * u_coherence_radius)));
+    pos += vel * D;
+
+    // 7. Boundary wrap (v10.py lines 630-631)
+    if (abs(pos.x) > 1.2) pos.x *= -0.98;
+    if (abs(pos.y) > 1.2) pos.y *= -0.98;
+
+    // 8. Boundary memory re-injection in shell zone
+    vec2 px2d = project4d(pos.x, pos.y, pos.z, pos.w);
+    float R_here = length(pos);
+    if (R_here > u_coherence_radius * BM_SHELL_INNER &&
+        R_here < u_coherence_radius * BM_SHELL_OUTER) {
+        vec2 mv = boundary_mem_sample(px2d);
+        vel.x += mv.x * BM_SAMPLE_GAIN;
+        vel.y += mv.y * BM_SAMPLE_GAIN;
+        vel.z += (-mv.y) * (BM_SAMPLE_GAIN * (1.0/PHI));  // zw: 1/φ — matches physics.comp
+        vel.w += ( mv.x) * (BM_SAMPLE_GAIN * (1.0/PHI));
+    }
+
+    // 9. Charge decay (v10.py line 746)
+    charge *= NODE_CHARGE_DAMP;
+
+    // 10. Alpha (v10.py lines 741-742)
+    float alpha = clamp(30.0 + charge * 225.0, 0.0, 255.0);
+
+    // 11. NULL:DEATH — collapse visual position to screen center (v10.py line 738)
+
+    b[id].pos   = pos;
+    b[id].vel   = vel;
+    b[id].state = vec4(stress, seam_charge, reflect_charge, reflect_age);
+    b[id].pout  = vec4(float(g_ecursor), px2d.x, px2d.y, alpha);
+    b[id].extra = vec4(charge, 0.0, 0.0, 0.0);
+}

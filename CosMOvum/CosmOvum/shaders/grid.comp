@@ -1,0 +1,152 @@
+// C_ENTROPY_SIZE, C_N_NODES, C_FREQ_GRID_CELLS, C_FREQ_GRID_PLANES,
+// C_FREQ_GRID_STRIDE, C_PARTICLE_COUNT injected by compile_shader_with_defs
+layout(local_size_x = 9, local_size_y = 9) in;
+
+// Dual 9x9 per-plane frequency grid: agent 9/25 + agent 16/25 design spec.
+// Each of 12 nodes has 2 perpendicular planes. Each plane has 81 cells.
+// FG[node * STRIDE + plane * 81 + gy * 9 + gx] = (amplitude, phase, drift, weight)
+//
+// The 9 canonical Solfeggio frequencies are arranged in 3x3 base tiled to 9x9:
+//   gx % 3 → frequency column group (root-3, root-6, root-9)
+//   gy % 3 → frequency row group (same, giving cross-product resonance)
+// This creates 81 unique resonance loci per plane without hardcoding positions.
+//
+// Particle -> grid: each particle deposits charge into its frequency-nearest cells.
+// Grid -> particle: physics.comp reads grid to derive field conditions (emergent cos/sin).
+// This is the spatial frequency memory missing from all prior GPU versions.
+
+struct Particle {
+    vec4  pos;    // x, y, z, w
+    vec4  vel;    // dx, dy, dz, dw
+    vec4  state;  // stress, seam_charge, reflect_charge, reflect_age
+    vec4  aeon;   // freq, r, g, b
+    vec4  pout;   // entropy_cursor, px, py, alpha
+    vec4  extra;  // charge, _pad, _pad, _pad
+    uvec4 ids;    // node_id, origin_node_id, traversal_flags, particle_uid
+};
+
+layout(std430, binding = 0) readonly buffer ParticleBuf { Particle p[]; };
+layout(std430, binding = 1) readonly buffer EntropyBuf  { float E[]; };
+layout(std430, binding = 4) buffer FreqGridBuf { vec4 FG[]; };
+
+uniform int   u_node_id;
+uniform int   u_plane_id;
+uniform uint  u_particle_count;
+uniform float u_time_step;
+uniform float u_global_angle;
+
+const float PHI        = 1.61803398875;
+// φ-derived decay constants (exact derivations):
+//   GRID_DECAY ≈ 1 - φ^{-11} = 1 - 1/199.005 ≈ 0.99498
+//   GRID_AMP_GAIN ≈ φ^{-10}  = 1/121.997     ≈ 0.00820
+//   GRID_D_COUPLE = φ^{-10}/2                 ≈ 0.00410
+//   GRID_AW_RATE  ≈ φ^{-14}  = 1/842.9       ≈ 0.00119
+//   GRID_DRIFT_EV ≈ φ^{-17}  = 1/3570.5      ≈ 0.000280 (stochastic drift noise)
+const float PHI10      = PHI*PHI*PHI*PHI*PHI*PHI*PHI*PHI*PHI*PHI;          // φ^10 ≈ 122
+const float PHI11      = PHI10 * PHI;                                         // φ^11 ≈ 199
+const float PHI14      = PHI10 * PHI*PHI*PHI*PHI;                            // φ^14 ≈ 843
+const float PHI17      = PHI14 * PHI*PHI*PHI;                                 // φ^17 ≈ 3571
+const float GRID_DECAY    = 1.0 - 1.0 / PHI11;   // φ^{-11} ≈ 0.99498
+const float GRID_AMP_GAIN = 1.0 / PHI10;          // φ^{-10} ≈ 0.00820
+const float GRID_D_COUPLE = 1.0 / (PHI10 * 2.0); // φ^{-10}/2 ≈ 0.00410
+const float GRID_AW_RATE  = 1.0 / PHI14;          // φ^{-14} ≈ 0.00119
+const float GRID_DRIFT_EV = 1.0 / PHI17;          // φ^{-17} ≈ 0.000280
+const float CELL_R     = 2.0 / 8.0;   // cell radius in [-1,1] space
+
+// 9 Solfeggio frequencies in 3x3 arrangement (row-major, tiled to 9x9)
+const float GRID_FREQS[9] = float[9](
+    7.83,   174.0,  528.0,
+    432.0,  126.22, 210.42,
+    741.0,  852.0,  963.0
+);
+
+uint g_ec;
+float eg() { float v = E[g_ec % C_ENTROPY_SIZE]; g_ec++; return v; }
+
+void main() {
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    if (gx >= 9 || gy >= 9) return;
+
+    int cell_idx = u_node_id * C_FREQ_GRID_STRIDE + u_plane_id * C_FREQ_GRID_CELLS
+                 + gy * 9 + gx;
+
+    g_ec = uint(cell_idx * 97u + uint(u_global_angle * 1000.0));
+
+    // Cell's canonical frequency from 3x3 base (tiled: gx%3, gy%3)
+    float cell_freq = GRID_FREQS[(gy % 3) * 3 + (gx % 3)];
+
+    // Cell center in [-1, 1] space
+    float cx = (float(gx) / 8.0) * 2.0 - 1.0;
+    float cy = (float(gy) / 8.0) * 2.0 - 1.0;
+
+    vec4 cs = FG[cell_idx];
+    float amplitude   = cs.x;
+    float phase       = cs.y;
+    float drift       = cs.z;
+    float axis_weight = cs.w;  // user-defined per-cell axis_weight from .bio seed
+
+    // Seed from entropy only if truly unvisited (no .bio seed and no prior update)
+    if (amplitude == 0.0 && drift == 0.0 && axis_weight == 0.0) {
+        amplitude   = eg() / float(C_FREQ_GRID_CELLS);
+        phase       = eg();
+        drift       = max(eg() * 0.12, 0.03);   // cycles/sec — 60× prior per-frame seed
+        axis_weight = eg();
+    }
+
+    // Decay
+    amplitude *= pow(GRID_DECAY, u_time_step);
+
+    // Accumulate particle contributions
+    // Preserve original grid deposit channels: plane A is XZ, plane B is YW.
+    // Crescent Moon field readings do not rewrite this existing grid.
+    float contrib = 0.0;
+    for (uint i = 0u; i < u_particle_count; i++) {
+        float pfreq = p[i].aeon.x;
+        float df    = abs(pfreq - cell_freq);
+        if (df >= PHI) continue;
+
+        float px = (u_plane_id == 0) ? p[i].pos.x : p[i].pos.y;
+        float py = (u_plane_id == 0) ? p[i].pos.z : p[i].pos.w;
+
+        float dx = px - cx, dy = py - cy;
+        float d2 = dx*dx + dy*dy;
+        if (d2 > CELL_R * CELL_R * 4.0) continue;
+
+        float fw = (1.0 - df / PHI);
+        float sw = exp(-d2 / (CELL_R * CELL_R));
+        float stress = p[i].state.x;
+        float charge = p[i].extra.x;
+
+        contrib += fw * sw * (abs(charge) + stress * 0.1) * u_time_step;
+    }
+
+    amplitude += contrib * GRID_AMP_GAIN;
+    amplitude  = clamp(amplitude, 0.0, 1.0);
+
+    // Agent 19/Bug 5: Intra-node coupling between planes A and B.
+    // Reading the conjugate plane (u_plane_id ^ 1) at the same cell gives
+    // D(x) = Φ_A(x) - Φ_B(x) — the emergent mirror axis field (Agent 26/B1).
+    // Coupling weight 0.40 (weaker than inter-node coupling, which uses Gaussian
+    // distance decay ~0.40 at cube-edge separations).
+    int conj_plane_idx = u_node_id * C_FREQ_GRID_STRIDE
+                       + (u_plane_id ^ 1) * C_FREQ_GRID_CELLS
+                       + gy * 9 + gx;
+    vec4 conj = FG[conj_plane_idx];
+    float D = amplitude - conj.x;          // signed differential: mirrors when D < 0
+    // kappa_void coupling: planes equilibrate at φ^{-10}/2 — slow but not locked.
+    amplitude = clamp(amplitude - D * GRID_D_COUPLE * u_time_step, 0.0, 1.0);
+
+    // Advance phase — triangle-wave carrier, like emergent_cos_sin in ball.comp
+    float debt = amplitude * (1.0 + drift);
+    phase = fract(phase + drift * (1.0 + debt) * u_time_step);
+
+    // Stochastic drift evolution: ±φ^{-17} noise on drift rate
+    drift = max(abs(drift + (eg() - 0.5) * GRID_DRIFT_EV * u_time_step), 0.0005);
+
+    // axis_weight evolves toward |D| at φ^{-14} rate — mirror geometry encodes slowly.
+    axis_weight = mix(axis_weight, clamp(abs(D) * PHI, 0.0, 1.0), GRID_AW_RATE * u_time_step);
+
+    // Preserve all four channels back to FreqGridBuf.
+    FG[cell_idx] = vec4(amplitude, phase, drift, axis_weight);
+}
